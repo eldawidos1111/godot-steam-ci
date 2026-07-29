@@ -1,0 +1,15 @@
+"AppBuild"
+{
+    "AppID" "__STEAM_APP_ID__"
+    "Desc" "Automated build %GITHUB_RUN_NUMBER%"
+    "BuildOutput" "build/steam"
+    "ContentRoot" "."
+    "SetLive" "public"
+
+    "Depots"
+    {
+        "__STEAM_DEPOT_ID_WINDOWS__" "steam/depot_windows.vdf"
+        "__STEAM_DEPOT_ID_LINUX__" "steam/depot_linux.vdf"
+    }
+}
+
