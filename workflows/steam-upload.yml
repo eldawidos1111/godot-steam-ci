@@ -1,0 +1,251 @@
+name: Build and Upload to Steam
+
+on:
+  push:
+    branches:
+      - Pre-Puchaczokalipsa
+  workflow_dispatch:
+    inputs:
+      upload_to_steam:
+        description: "Upload to Steam after building?"
+        default: true
+        type: boolean
+
+env:
+  PROJECT_DIR: dungeon-potato-(4.4)
+  GODOT_VERSION: 4.4-stable
+  
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      build_label: ${{ steps.build_label.outputs.label }}
+      build_desc: ${{ steps.build_label.outputs.desc }}
+      auto_submit: ${{ steps.build_label.outputs.auto_submit }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Derive build label
+        id: build_label
+        shell: bash
+        env:
+          HEAD_COMMIT_MSG: ${{ github.event.head_commit.message }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          # Logic to derive label
+          MSG="$HEAD_COMMIT_MSG"
+          # Get first line only (commit name)
+          SUBJECT=$(printf '%s\n' "$MSG" | head -n 1)
+          
+          AUTO_SUBMIT="false"
+          if [[ "$SUBJECT" == *"{LIVE}"* ]]; then
+            AUTO_SUBMIT="true"
+          fi
+          
+          RAW="${SUBJECT//"{LIVE}"/}"
+
+          # Trim whitespace
+          RAW=$(echo "$RAW" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+          if [[ -z "$RAW" ]]; then
+            RAW="$REF_NAME"
+          fi
+          if [[ -z "$RAW" ]]; then
+            RAW="$SHA"
+          fi
+          
+          DESC="$RAW"
+          
+          # Sanitize: replace non-alnum with - (allowing . and _)
+          SANITIZED=$(echo "$RAW" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          # Trim leading/trailing - and .
+          SANITIZED=$(echo "$SANITIZED" | sed 's/^[-.]*//;s/[-.]*$//')
+          
+          # If empty, use short SHA
+          if [[ -z "$SANITIZED" ]]; then
+            SANITIZED=$(echo "$SHA" | cut -c1-7)
+          fi
+          
+          # Truncate to 48 chars
+          SANITIZED=${SANITIZED:0:48}
+          
+          echo "label=$SANITIZED" >> $GITHUB_OUTPUT
+          echo "desc=$DESC" >> $GITHUB_OUTPUT
+          echo "auto_submit=$AUTO_SUBMIT" >> $GITHUB_OUTPUT
+          echo "Build Label: $SANITIZED"
+
+      - name: Install Wine
+        id: wine_install
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y wine64 wine32
+          echo "WINE_PATH=$(which wine)" >> $GITHUB_OUTPUT
+
+      - name: Update Export Presets
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          BUILD_LABEL: ${{ steps.build_label.outputs.label }}
+        run: |
+          set -euo pipefail
+          windows_path="./build/${BUILD_LABEL}/windows/DungeonPotato.exe"
+          linux_path="./build/${BUILD_LABEL}/linux/DungeonPotato.x86_64"
+
+          perl -0pi -e "s|export_path=\"[^\"]*DungeonPotato.exe\"|export_path=\"${windows_path}\"|" export_presets.cfg
+          perl -0pi -e "s|export_path=\"[^\"]*DungeonPotato.x86_64\"|export_path=\"${linux_path}\"|" export_presets.cfg
+
+          echo "Updated export_presets.cfg paths:"
+          grep "export_path" export_presets.cfg
+
+      - name: Export Game
+        uses: firebelley/godot-export@v7.0.0
+        with:
+          godot_executable_download_url: https://github.com/godotengine/godot/releases/download/${{ env.GODOT_VERSION }}/Godot_v${{ env.GODOT_VERSION }}_linux.x86_64.zip
+          godot_export_templates_download_url: https://github.com/godotengine/godot/releases/download/${{ env.GODOT_VERSION }}/Godot_v${{ env.GODOT_VERSION }}_export_templates.tpz
+          relative_project_path: ./${{ env.PROJECT_DIR }}
+          use_preset_export_path: true
+          export_debug: true
+          archive_output: false
+          wine_path: ${{ steps.wine_install.outputs.WINE_PATH }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: godot-builds
+          path: ${{ env.PROJECT_DIR }}/build
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || (github.event_name == 'workflow_dispatch' && github.event.inputs.upload_to_steam == 'true')
+    env:
+      BUILD_LABEL: ${{ needs.build.outputs.build_label }}
+      BUILD_DESC: ${{ needs.build.outputs.build_desc }}
+      AUTO_SUBMIT: ${{ needs.build.outputs.auto_submit }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: godot-builds
+          path: godot-builds
+
+      - name: Prepare Steam depot scripts
+        id: prepare_depots
+        shell: bash
+        env:
+          STEAM_APP_ID: ${{ secrets.STEAM_APP_ID }}
+          STEAM_DEPOT_ID_WINDOWS: ${{ secrets.STEAM_DEPOT_ID_WINDOWS }}
+          STEAM_DEPOT_ID_LINUX: ${{ secrets.STEAM_DEPOT_ID_LINUX }}
+        run: |
+          set -euo pipefail
+          required=(STEAM_APP_ID STEAM_DEPOT_ID_WINDOWS STEAM_DEPOT_ID_LINUX)
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "$name secret is missing." >&2
+              exit 1
+            fi
+          done
+
+          steam_root="$(pwd)/steam"
+          output_dir="$steam_root/generated"
+          mkdir -p "$output_dir"
+
+          base_candidates=(
+            "$GITHUB_WORKSPACE/godot-builds/${{ env.PROJECT_DIR }}/build"
+            "$GITHUB_WORKSPACE/godot-builds/build"
+            "$GITHUB_WORKSPACE/godot-builds"
+          )
+
+          artifact_base=""
+          for candidate in "${base_candidates[@]}"; do
+            if [[ -d "$candidate" ]]; then
+              artifact_base="$candidate"
+              break
+            fi
+          done
+
+          if [[ -z "$artifact_base" ]]; then
+            echo "Unable to locate artifact base directory. Contents of $GITHUB_WORKSPACE/godot-builds:"
+            ls -R "$GITHUB_WORKSPACE/godot-builds" || true
+            exit 1
+          fi
+
+          artifact_root=""
+          candidate_path="$artifact_base/${BUILD_LABEL}"
+          if [[ -d "$candidate_path" ]]; then
+            artifact_root="$candidate_path"
+          else
+            mapfile -t label_matches < <(find "$artifact_base" -type d -name "$BUILD_LABEL" | sort)
+            if [[ "${#label_matches[@]}" -gt 0 ]]; then
+              artifact_root="${label_matches[0]}"
+              echo "Resolved artifact directory via search: $artifact_root"
+            else
+              mapfile -t siblings < <(find "$artifact_base" -mindepth 1 -maxdepth 1 -type d | sort)
+              if [[ "${#siblings[@]}" -eq 1 ]]; then
+                artifact_root="${siblings[0]}"
+                echo "Using sole artifact directory: $artifact_root"
+              elif [[ "${#siblings[@]}" -gt 1 ]]; then
+                echo "Ambiguous artifact directories under $artifact_base:"
+                printf '  %s\n' "${siblings[@]}"
+                exit 1
+              else
+                echo "No artifact directories found under $artifact_base"
+                exit 1
+              fi
+            fi
+          fi
+
+          for platform in windows linux; do
+            if [[ ! -d "$artifact_root/$platform" ]]; then
+              echo "Missing $platform export in $artifact_root"
+              ls -R "$artifact_root" || true
+              exit 1
+            fi
+          done
+
+          artifact_label="$(basename "$artifact_root")"
+          declare -A mapping=(
+            ["__STEAM_APP_ID__"]="$STEAM_APP_ID"
+            ["__STEAM_DEPOT_ID_WINDOWS__"]="$STEAM_DEPOT_ID_WINDOWS"
+            ["__STEAM_DEPOT_ID_LINUX__"]="$STEAM_DEPOT_ID_LINUX"
+            ["__CONTENT_ROOT_WINDOWS__"]="$artifact_root/windows"
+            ["__CONTENT_ROOT_LINUX__"]="$artifact_root/linux"
+          )
+
+          for file in "$steam_root"/depot_*.vdf; do
+            [[ -f "$file" ]] || continue
+            content="$(cat "$file")"
+            for key in "${!mapping[@]}"; do
+              content="${content//${key}/${mapping[$key]}}"
+            done
+            out="$output_dir/$(basename "$file")"
+            printf '%s' "$content" > "$out"
+          done
+
+          rel_root="$(realpath --relative-to="$GITHUB_WORKSPACE" "$artifact_root")"
+          echo "artifact_root=$rel_root" >> "$GITHUB_OUTPUT"
+          echo "build_label=$artifact_label" >> "$GITHUB_OUTPUT"
+          echo "depot_windows=$output_dir/depot_windows.vdf" >> "$GITHUB_OUTPUT"
+          echo "depot_linux=$output_dir/depot_linux.vdf" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to Steam
+        uses: game-ci/steam-deploy@v3
+        with:
+          username: ${{ secrets.STEAM_USERNAME }}
+          configVdf: ${{ secrets.STEAM_CONFIG_VDF }}
+          appId: ${{ secrets.STEAM_APP_ID }}
+          buildDescription: ${{ env.BUILD_DESC }}
+          rootPath: ${{ steps.prepare_depots.outputs.artifact_root }}
+          depot1Path: windows
+          depot1InstallScriptPath: ${{ steps.prepare_depots.outputs.depot_windows }}
+          depot2Path: linux
+          depot2InstallScriptPath: ${{ steps.prepare_depots.outputs.depot_linux }}
+          releaseBranch: ${{ env.AUTO_SUBMIT == 'true' && 'public' || '' }}
